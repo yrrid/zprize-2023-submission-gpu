@@ -33,7 +33,6 @@ Author(s):  Niall Emmart
 
 #define CUDA_CHECK(call) { int localEC=call; if(localEC!=cudaSuccess) { printf("\nCall \"" #call "\" failed from %s, line %d, error=%d\n", __FILE__, __LINE__, localEC); exit(1); } }
 
-
 /********************************************************************************************
  * Possible run options for BLS12377G1:
  *
@@ -189,6 +188,8 @@ void* resultOffset(void* ptr, int32_t bytes) {
 
   return (void*)(ptr8+bytes);
 }
+
+extern "C" {
 
 void* createContext(uint32_t curve, uint32_t maxBatchCount, uint32_t maxPointCount) {
   MSMBatch* batch=new MSMBatch(curve, maxBatchCount, maxPointCount);
@@ -349,4 +350,6 @@ int32_t processBatches(void* contextPtr, void* resultData, void** scalarData, ui
   CUDA_CHECK(cudaStreamDestroy(runStream));
   CUDA_CHECK(cudaStreamDestroy(memoryStream));
   return 0;
+}
+
 }
