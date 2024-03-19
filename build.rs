@@ -16,6 +16,7 @@ fn main() {
         cc::Build::new()
             .cpp(true)
             .cuda(true)
+            .flag("-arch=sm_80")
             .std("c++17")
             .file("yrrid-gpu-msm/MSMBatch.cu")
             .opt_level(3)
