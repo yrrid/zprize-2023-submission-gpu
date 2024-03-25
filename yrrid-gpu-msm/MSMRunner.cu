@@ -236,10 +236,11 @@ int32_t MSMRunner<Curve, accumulation, windowBits, binBits, safety>::runAccumula
     if(ec!=0) return ec;
   }
 
+  // about ACCUMULATION_EXTENDED_JACOBIAN and ACCUMULATION_EXTENDED_JACOBIAN_ML are about 1.5% faster with 3 blocks instead of 2
   if constexpr (accumulation==ACCUMULATION_EXTENDED_JACOBIAN) 
-    accumulateExtendedJacobianBuckets<Curve, 2><<<BUCKET_COUNT/128, 128, 19616, stream>>>(bucketMemory, planning, pointMemory, preloaded);
+    accumulateExtendedJacobianBuckets<Curve, 3><<<BUCKET_COUNT/128, 128, 19616, stream>>>(bucketMemory, planning, pointMemory, preloaded);
   else if constexpr (accumulation==ACCUMULATION_EXTENDED_JACOBIAN_ML) {
-    accumulateExtendedJacobianMLBuckets<Curve, 2><<<BUCKET_COUNT/128, 128, 19616, stream>>>(bucketMemory, planning, pointMemory, preloaded);
+    accumulateExtendedJacobianMLBuckets<Curve, 3><<<BUCKET_COUNT/128, 128, 19616, stream>>>(bucketMemory, planning, pointMemory, preloaded);
   }
   else if constexpr (accumulation==ACCUMULATION_TWISTED_EDWARDS_XY) {
     accumulateTwistedEdwardsXYBuckets<Curve, 2><<<BUCKET_COUNT/128, 128, 32416, stream>>>(bucketMemory, planning, pointMemory, preloaded);
@@ -247,8 +248,6 @@ int32_t MSMRunner<Curve, accumulation, windowBits, binBits, safety>::runAccumula
   else if constexpr (accumulation==ACCUMULATION_TWISTED_EDWARDS_XYT) {
     accumulateTwistedEdwardsXYTBuckets<Curve, 2><<<BUCKET_COUNT/128, 128, 32416, stream>>>(bucketMemory, planning, pointMemory, preloaded);
   }
-  ec=cudaStreamSynchronize(stream);
-  if(ec!=0) return ec;
   return cudaSuccess;
 }
 

@@ -33,6 +33,7 @@ Author(s):  Niall Emmart
 
 #define CUDA_CHECK(call) { int localEC=call; if(localEC!=cudaSuccess) { printf("\nCall \"" #call "\" failed from %s, line %d, error=%d\n", __FILE__, __LINE__, localEC); exit(1); } }
 
+
 /********************************************************************************************
  * Possible run options for BLS12377G1:
  *
@@ -48,7 +49,7 @@ Author(s):  Niall Emmart
  ********************************************************************************************/
 
 typedef MSMRunner<BLS12377G1, ACCUMULATION_TWISTED_EDWARDS_XY, 23, 6, 2> Best377;
-typedef MSMRunner<BLS12381G1, ACCUMULATION_EXTENDED_JACOBIAN_ML, 22, 6, 2> Best381;
+typedef MSMRunner<BLS12381G1, ACCUMULATION_EXTENDED_JACOBIAN_ML, 22, 5, 2> Best381;
 
 class MSMBatch {
   public:
@@ -66,9 +67,8 @@ class MSMBatch {
   void*        bucketMemory;
   void*        reduceMemory;
 
-  cudaEvent_t  eighthReadyEvent;
-  cudaEvent_t  halfReadyEvent;
-  cudaEvent_t* scalarReadyEvents;
+  cudaStream_t memoryStream;
+  cudaStream_t runStream;
   cudaEvent_t* resultReadyEvents;
 
   // ok -- this isn't ideal to dispatch to one curve or the other... oh well
@@ -88,7 +88,6 @@ class MSMBatch {
     bucketMemory=NULL;
     reduceMemory=NULL;
 
-    scalarReadyEvents=NULL;
     resultReadyEvents=NULL;
   }
 
@@ -175,18 +174,34 @@ class MSMBatch {
 
 };
 
-void* scalarOffset(void* ptr, int32_t scalarCount) {
-  int64_t  offset=scalarCount;
+void* byteOffset(void* ptr, size_t bytes) {
+  uint8_t* ptr8=(uint8_t*)ptr;
+
+  return (void*)(ptr8+bytes);
+}
+
+void* scalarOffset(void* ptr, uint32_t scalarIndex) {
+  size_t   offset=scalarIndex;
   uint8_t* ptr8=(uint8_t*)ptr;
 
   offset*=32;
   return (void*)(ptr8+offset);
 }
 
-void* resultOffset(void* ptr, int32_t bytes) {
+void* reduceOffset(void* ptr, uint32_t reduceIndex, size_t reduceBytes) {
+  uint8_t* ptr8=(uint8_t*)ptr;
+  size_t   offset=reduceIndex;
+  
+  offset*=reduceBytes;
+  return (void*)(ptr8+offset);
+}
+
+void* pointOffset(void* ptr, uint32_t pointIndex, uint32_t fields=2) {
+  size_t   offset=pointIndex*fields;
   uint8_t* ptr8=(uint8_t*)ptr;
 
-  return (void*)(ptr8+bytes);
+  offset*=48;
+  return (void*)(ptr8+offset);
 }
 
 extern "C" {
@@ -194,15 +209,13 @@ extern "C" {
 void* createContext(uint32_t curve, uint32_t maxBatchCount, uint32_t maxPointCount) {
   MSMBatch* batch=new MSMBatch(curve, maxBatchCount, maxPointCount);
 
-  batch->scalarReadyEvents=(cudaEvent_t*)malloc(sizeof(cudaEvent_t)*maxBatchCount);
+  CUDA_CHECK(cudaStreamCreate(&batch->memoryStream));
+  CUDA_CHECK(cudaStreamCreate(&batch->runStream));
+
   batch->resultReadyEvents=(cudaEvent_t*)malloc(sizeof(cudaEvent_t)*maxBatchCount);
 
-  CUDA_CHECK(cudaEventCreate(&batch->eighthReadyEvent));
-  CUDA_CHECK(cudaEventCreate(&batch->halfReadyEvent));
-  for(int i=0;i<maxBatchCount;i++) {
-    CUDA_CHECK(cudaEventCreate(&batch->scalarReadyEvents[i]));
+  for(int i=0;i<maxBatchCount;i++) 
     CUDA_CHECK(cudaEventCreate(&batch->resultReadyEvents[i]));
-  }
   
   return batch;
 }
@@ -210,12 +223,11 @@ void* createContext(uint32_t curve, uint32_t maxBatchCount, uint32_t maxPointCou
 int32_t destroyContext(void* contextPtr) {
   MSMBatch* batch=(MSMBatch*)contextPtr;
 
-  CUDA_CHECK(cudaEventDestroy(batch->eighthReadyEvent));
-  CUDA_CHECK(cudaEventDestroy(batch->halfReadyEvent));
-  for(int i=0;i<batch->maxBatchCount;i++) {
-    CUDA_CHECK(cudaEventDestroy(batch->scalarReadyEvents[i]));
+  CUDA_CHECK(cudaStreamDestroy(batch->memoryStream));
+  CUDA_CHECK(cudaStreamDestroy(batch->runStream));
+
+  for(int i=0;i<batch->maxBatchCount;i++) 
     CUDA_CHECK(cudaEventDestroy(batch->resultReadyEvents[i]));
-  }
 
   // clean up as much memory as possible
   if(batch->pointMemory!=NULL) 
@@ -274,81 +286,74 @@ int32_t preprocessPoints(void* contextPtr, void* pointData, uint32_t pointCount)
 
 int32_t processBatches(void* contextPtr, void* resultData, void** scalarData, uint32_t batchCount, uint32_t pointCount) {
   MSMBatch*    batch=(MSMBatch*)contextPtr;
-  cudaStream_t memoryStream, runStream;
+  size_t       reduceBytes=batch->reduceBytesRequired();
   void*        gpuScalars;
-  void*        gpuResults;
+  void*        gpuReduce;
   void*        cpuScalars;
-  void*        cpuResult;
+  void*        cpuReduce;
   uint32_t     oneEighth=pointCount>>3;
   uint32_t     threeEighths=3*oneEighth;
   uint32_t     oneHalf=pointCount>>1;
   uint32_t     resultPointCount;
 
-  CUDA_CHECK(cudaStreamCreate(&memoryStream));
-  CUDA_CHECK(cudaStreamCreate(&runStream));
+  cpuReduce=malloc(reduceBytes);
 
-  // QUEUE UP ALL THE MEMORY COPIES
-
-  gpuScalars=batch->scalarMemory;
+  // copy and accumulate the first 1/8th of batch[0] scalars
   cpuScalars=scalarData[0];
-  CUDA_CHECK(cudaMemcpyAsync(scalarOffset(gpuScalars, 0), scalarOffset(cpuScalars, 0), oneEighth*32, cudaMemcpyHostToDevice, memoryStream));
-  CUDA_CHECK(cudaEventRecord(batch->eighthReadyEvent, memoryStream));
-  CUDA_CHECK(cudaMemcpyAsync(scalarOffset(gpuScalars, oneEighth), scalarOffset(cpuScalars, oneEighth), threeEighths*32, cudaMemcpyHostToDevice, memoryStream));
-  CUDA_CHECK(cudaEventRecord(batch->halfReadyEvent, memoryStream));
-  CUDA_CHECK(cudaMemcpyAsync(scalarOffset(gpuScalars, oneHalf), scalarOffset(cpuScalars, oneHalf), oneHalf*32, cudaMemcpyHostToDevice, memoryStream));
-  CUDA_CHECK(cudaEventRecord(batch->scalarReadyEvents[0], memoryStream));
-
-  for(int i=1;i<batchCount;i++) {
-    gpuScalars=scalarOffset(batch->scalarMemory, pointCount*i);
-    cpuScalars=scalarData[i];
-    CUDA_CHECK(cudaMemcpyAsync(gpuScalars, cpuScalars, pointCount*32, cudaMemcpyHostToDevice, memoryStream));
-    CUDA_CHECK(cudaEventRecord(batch->scalarReadyEvents[i], memoryStream));
-  }
-
-  // QUEUE UP ALL THE RUNS 
-
   gpuScalars=batch->scalarMemory;
-  gpuResults=batch->reduceMemory;
-  CUDA_CHECK(cudaStreamWaitEvent(runStream, batch->eighthReadyEvent));
-  CUDA_CHECK(batch->runPlanning(runStream, batch->planningMemory, gpuScalars, 0, oneEighth));
-  CUDA_CHECK(batch->runAccumulate(runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory));
+  gpuReduce=batch->reduceMemory;
 
-  CUDA_CHECK(cudaStreamWaitEvent(runStream, batch->halfReadyEvent));
-  CUDA_CHECK(batch->runPlanning(runStream, batch->planningMemory, gpuScalars, oneEighth, oneHalf));
-  CUDA_CHECK(batch->runAccumulate(runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory, true));
+  CUDA_CHECK(cudaMemcpyAsync(gpuScalars, cpuScalars, oneEighth*32, cudaMemcpyHostToDevice, batch->memoryStream));
+  CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+  CUDA_CHECK(batch->runPlanning(batch->runStream, batch->planningMemory, gpuScalars, 0, oneEighth));
+  CUDA_CHECK(batch->runAccumulate(batch->runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory));
 
-  CUDA_CHECK(cudaStreamWaitEvent(runStream, batch->scalarReadyEvents[0]));
-  CUDA_CHECK(batch->runPlanning(runStream, batch->planningMemory, gpuScalars, oneHalf, pointCount));
-  CUDA_CHECK(batch->runAccumulate(runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory, true));
-  CUDA_CHECK(batch->runReduce(runStream, &resultPointCount, gpuResults, batch->bucketMemory));
-  CUDA_CHECK(cudaEventRecord(batch->resultReadyEvents[0], runStream));
+  // copy and accumulate the next 3/8ths of batch[0] scalars
+  CUDA_CHECK(cudaMemcpyAsync(scalarOffset(gpuScalars, oneEighth), scalarOffset(cpuScalars, oneEighth), threeEighths*32, cudaMemcpyHostToDevice, batch->memoryStream));
+  CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+  CUDA_CHECK(batch->runPlanning(batch->runStream, batch->planningMemory, gpuScalars, oneEighth, oneHalf));
+  CUDA_CHECK(batch->runAccumulate(batch->runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory, true));
+
+  // copy and accumulate the last 1/2 of batch[0] scalars
+  CUDA_CHECK(cudaMemcpyAsync(scalarOffset(gpuScalars, oneHalf), scalarOffset(cpuScalars, oneHalf), oneHalf*32, cudaMemcpyHostToDevice, batch->memoryStream));
+  CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+  CUDA_CHECK(batch->runPlanning(batch->runStream, batch->planningMemory, gpuScalars, oneHalf, pointCount));
+  CUDA_CHECK(batch->runAccumulate(batch->runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory, true));
+
+  // reduce and announce results ready
+  CUDA_CHECK(batch->runReduce(batch->runStream, &resultPointCount, gpuReduce, batch->bucketMemory));
+  CUDA_CHECK(cudaEventRecord(batch->resultReadyEvents[0], batch->runStream));
 
   for(int i=1;i<batchCount;i++) {
+    // copy and run the next set of scalars
+    cpuScalars=scalarData[i];
     gpuScalars=scalarOffset(batch->scalarMemory, pointCount*i);
-    gpuResults=resultOffset(batch->reduceMemory, batch->reduceBytesRequired()*i); 
-    CUDA_CHECK(cudaStreamWaitEvent(runStream, batch->scalarReadyEvents[i]));
-    CUDA_CHECK(batch->runPlanning(runStream, batch->planningMemory, gpuScalars, pointCount));
-    CUDA_CHECK(batch->runAccumulate(runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory));
-    CUDA_CHECK(batch->runReduce(runStream, &resultPointCount, gpuResults, batch->bucketMemory));
-    CUDA_CHECK(cudaEventRecord(batch->resultReadyEvents[i], runStream));
+    gpuReduce=reduceOffset(batch->reduceMemory, i, reduceBytes);
+
+    CUDA_CHECK(cudaMemcpyAsync(gpuScalars, cpuScalars, pointCount*32, cudaMemcpyHostToDevice, batch->memoryStream));
+    CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+    CUDA_CHECK(batch->runPlanning(batch->runStream, batch->planningMemory, gpuScalars, pointCount));
+    CUDA_CHECK(batch->runAccumulate(batch->runStream, batch->bucketMemory, batch->planningMemory, batch->scaledPointMemory));
+    CUDA_CHECK(batch->runReduce(batch->runStream, NULL, gpuReduce, batch->bucketMemory));
+    CUDA_CHECK(cudaEventRecord(batch->resultReadyEvents[i], batch->runStream));
+
+    // copy the results points of the prior run [run i-1] back and process them into a final result
+    gpuReduce=reduceOffset(batch->reduceMemory, i-1, reduceBytes);
+
+    CUDA_CHECK(cudaEventSynchronize(batch->resultReadyEvents[i-1]));
+    CUDA_CHECK(cudaMemcpyAsync(cpuReduce, gpuReduce, reduceBytes, cudaMemcpyDeviceToHost, batch->memoryStream));
+    CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+    batch->runFinalReduce(pointOffset(resultData, i-1, FIELDS_XY), cpuReduce, resultPointCount); 
   }
 
-  // PROCESS THE RESULTS
+  // copy the results points of the prior run [run i-1] back and process them into a final result
+  gpuReduce=reduceOffset(batch->reduceMemory, batchCount-1, reduceBytes);
+  CUDA_CHECK(cudaEventSynchronize(batch->resultReadyEvents[batchCount-1]));
+  CUDA_CHECK(cudaMemcpyAsync(cpuReduce, gpuReduce, reduceBytes, cudaMemcpyDeviceToHost, batch->memoryStream));
+  CUDA_CHECK(cudaStreamSynchronize(batch->memoryStream));
+  batch->runFinalReduce(pointOffset(resultData, batchCount-1, FIELDS_XY), cpuReduce, resultPointCount); 
 
-  cpuResult=(void*)malloc(resultPointCount*192);
-
-  for(int i=0;i<batchCount;i++) {
-    gpuResults=resultOffset(batch->reduceMemory, batch->reduceBytesRequired()*i); 
-    CUDA_CHECK(cudaStreamWaitEvent(memoryStream, batch->resultReadyEvents[i]));
-    CUDA_CHECK(cudaMemcpyAsync(cpuResult, gpuResults, resultPointCount*192, cudaMemcpyDeviceToHost, memoryStream));
-    CUDA_CHECK(cudaStreamSynchronize(memoryStream));
-    batch->runFinalReduce(resultOffset(resultData, 96*i), cpuResult, resultPointCount); 
-  }
-
-  free(cpuResult);
-
-  CUDA_CHECK(cudaStreamDestroy(runStream));
-  CUDA_CHECK(cudaStreamDestroy(memoryStream));
+  free(cpuReduce);
   return 0;
 }
 
